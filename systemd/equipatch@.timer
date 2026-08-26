@@ -1,0 +1,11 @@
+[Unit]
+Description=Fallback check for the Equicord patch on %i
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Unit=equipatch@%i.service
+
+[Install]
+WantedBy=timers.target

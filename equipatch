@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+#
+# equipatch [patch|unpatch|status|launch] [flavor] [-- launcher args]
+#   flavor: discord (default), discordcanary, discordptb
+
+set -euo pipefail
+
+command=${1:-patch}
+flavor=${2:-discord}
+shift $(( $# > 2 ? 2 : $# ))
+[[ ${1:-} == -- ]] && shift
+
+case $flavor in
+    discord)       exe=Discord;       launcher=discord ;;
+    discordcanary) exe=DiscordCanary; launcher=discord-canary ;;
+    discordptb)    exe=DiscordPTB;    launcher=discord-ptb ;;
+    *) printf 'equipatch: unknown flavor: %s\n' "$flavor" >&2; exit 64 ;;
+esac
+
+config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}
+discord_dir=${DISCORD_DIR:-"$config_home/$flavor"}
+equicord_asar=${EQUICORD_ASAR:-"$config_home/Equicord/equicord.asar"}
+runtime_dir=${XDG_RUNTIME_DIR:-"$config_home"}
+lock_file=${EQUIPATCH_LOCK_FILE:-"$runtime_dir/equipatch-$flavor.lock"}
+
+log() {
+    printf 'equipatch[%s]: %s\n' "$flavor" "$*"
+}
+
+notify() {
+    command -v notify-send >/dev/null || return 0
+    notify-send -a equipatch -i "$launcher" "$@" 2>/dev/null || true
+}
+
+find_resources() {
+    local discord_host app_dir
+
+    discord_host="$discord_dir/$exe"
+    if [[ -e "$discord_host" ]]; then
+        discord_host=$(readlink -f -- "$discord_host")
+        app_dir=$(dirname -- "$discord_host")
+        if [[ -d "$app_dir/resources" ]]; then
+            printf '%s\n' "$app_dir/resources"
+            return 0
+        fi
+    fi
+
+    find "$discord_dir" -mindepth 2 -maxdepth 2 -type d -path '*/app-*/resources' -print 2>/dev/null \
+        | sort -V \
+        | tail -n 1
+}
+
+# Same format as Equilotl: a directory named app.asar. Electron treats .asar
+# paths it cannot open as archives like ordinary directories.
+write_loader() {
+    local output=$1
+
+    printf '{\n\t"name": "discord",\n\t"main": "index.js"\n}' > "$output/package.json"
+    printf 'require("%s")' "$js_path" > "$output/index.js"
+}
+
+loader_is_ours() {
+    [[ -d "$app_asar" ]] && grep -Fq -- "$js_path" "$app_asar/index.js" 2>/dev/null
+}
+
+discord_running() {
+    pgrep -x "$exe" >/dev/null 2>&1
+}
+
+# Escaped for a JS string literal; the same string is used for the up-to-date check.
+js_path=${equicord_asar//\\/\\\\}
+js_path=${js_path//\"/\\\"}
+
+locate() {
+    resources=$(find_resources)
+    if [[ -z "$resources" || ! -d "$resources" ]]; then
+        log "Discord resources directory not found: $discord_dir"
+        return 1
+    fi
+    app_asar="$resources/app.asar"
+    original_asar="$resources/_app.asar"
+}
+
+do_patch() {
+    if [[ ! -f "$equicord_asar" ]]; then
+        log "Equicord not found: $equicord_asar"
+        return 1
+    fi
+    locate || return 1
+
+    if [[ -f "$original_asar" ]]; then
+        if [[ -d "$app_asar" ]]; then
+            if loader_is_ours; then
+                log "patch already up to date: $resources"
+                return 0
+            fi
+            log "another client mod is installed (index.js does not point to Equicord); leaving files untouched: $resources"
+            return 1
+        fi
+
+        if [[ ! -e "$app_asar" || $(stat -c %s -- "$app_asar") -le 131072 ]]; then
+            log "unrecognised client-mod patch found; leaving files untouched: $resources"
+            return 1
+        fi
+
+        # Discord refreshed the same version directory; the old backup is stale.
+        rm -- "$original_asar"
+    elif [[ -d "$app_asar" ]]; then
+        log "app.asar is a directory but there is no _app.asar backup; leaving files untouched: $resources"
+        return 1
+    fi
+
+    if [[ ! -f "$app_asar" ]]; then
+        log "app.asar not found: $app_asar"
+        return 1
+    fi
+
+    local loader_tmp
+    loader_tmp=$(mktemp -d --tmpdir="$resources" .equipatch-app.asar.XXXXXX)
+    trap 'rm -rf -- "$loader_tmp"' RETURN
+
+    write_loader "$loader_tmp"
+    chmod --reference="$resources" "$loader_tmp"
+
+    # Back up via hardlink: no copy, and the original is never absent.
+    ln -- "$app_asar" "$original_asar"
+    rm -- "$app_asar"
+    if ! mv -- "$loader_tmp" "$app_asar"; then
+        ln -- "$original_asar" "$app_asar"
+        return 1
+    fi
+
+    log "Equicord patch applied: $resources"
+    if discord_running; then
+        notify "Equicord patch applied" "$exe is already running; restart it to load Equicord."
+    fi
+}
+
+do_unpatch() {
+    locate || return 1
+
+    if [[ ! -f "$original_asar" ]]; then
+        log "not patched: $resources"
+        return 0
+    fi
+    if [[ -d "$app_asar" ]] && ! loader_is_ours; then
+        log "another client mod is installed; leaving files untouched: $resources"
+        return 1
+    fi
+    if [[ -f "$app_asar" && $(stat -c %s -- "$app_asar") -gt 131072 ]]; then
+        log "app.asar already looks original; removing stale backup: $resources"
+        rm -- "$original_asar"
+        return 0
+    fi
+
+    rm -rf -- "$app_asar"
+    mv -- "$original_asar" "$app_asar"
+    log "patch removed: $resources"
+}
+
+do_status() {
+    if ! locate >/dev/null 2>&1; then
+        printf '%-14s not installed (%s)\n' "$flavor" "$discord_dir"
+        return 0
+    fi
+    local state target
+    if loader_is_ours; then
+        state="patched"
+        target=$(sed -n 's/^require("\(.*\)")$/\1/p' "$app_asar/index.js")
+        [[ -f "$target" ]] || state="patched but target asar is MISSING"
+    elif [[ -f "$original_asar" ]]; then
+        state="patched by another client mod"
+    else
+        state="not patched"
+    fi
+    printf '%-14s %-32s %s\n' "$flavor" "$state" "$resources"
+    [[ -n ${target:-} ]] && printf '%-14s -> %s\n' '' "$target"
+    discord_running && printf '%-14s (running)\n' ''
+    return 0
+}
+
+do_launch() {
+    # Discord must start even if patching fails.
+    do_patch || true
+    if command -v "$launcher" >/dev/null; then
+        exec "$launcher" "$@"
+    fi
+    exec "$discord_dir/$exe" "$@"
+}
+
+case $command in
+    patch|unpatch)
+        exec 9>"$lock_file"
+        flock 9
+        "do_$command"
+        ;;
+    status) do_status ;;
+    launch) do_launch "$@" ;;
+    *) printf 'usage: equipatch [patch|unpatch|status|launch] [discord|discordcanary|discordptb] [-- args]\n' >&2; exit 64 ;;
+esac

@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch %i's active version for Equicord
+
+[Path]
+PathChanged=%E/%i/Discord
+PathChanged=%E/%i/DiscordCanary
+PathChanged=%E/%i/DiscordPTB
+Unit=equipatch@%i.service
+
+[Install]
+WantedBy=default.target

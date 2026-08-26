@@ -1,0 +1,6 @@
+[Unit]
+Description=Reapply Equicord after %i updates
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/equipatch patch %i
