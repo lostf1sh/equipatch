@@ -11,16 +11,34 @@ shift $(( $# > 2 ? 2 : $# ))
 [[ ${1:-} == -- ]] && shift
 
 case $flavor in
-    discord)       exe=Discord;       launcher=discord ;;
-    discordcanary) exe=DiscordCanary; launcher=discord-canary ;;
-    discordptb)    exe=DiscordPTB;    launcher=discord-ptb ;;
+    discord)       exe=Discord;       launcher=discord;        mac_app='Discord.app' ;;
+    discordcanary) exe=DiscordCanary; launcher=discord-canary; mac_app='Discord Canary.app' ;;
+    discordptb)    exe=DiscordPTB;    launcher=discord-ptb;    mac_app='Discord PTB.app' ;;
     *) printf 'equipatch: unknown flavor: %s\n' "$flavor" >&2; exit 64 ;;
 esac
 
-config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}
-discord_dir=${DISCORD_DIR:-"$config_home/$flavor"}
+os=$(uname -s)
+
+if [[ $os == Darwin ]]; then
+    # Discord updates by replacing the whole bundle; there is no app-* dir.
+    # DISCORD_DIR is the .app bundle path.
+    config_home="$HOME/Library/Application Support"
+    process_name=${mac_app%.app}
+    if [[ -n ${DISCORD_DIR:-} ]]; then
+        discord_dir=$DISCORD_DIR
+    elif [[ -d "$HOME/Applications/$mac_app" ]]; then
+        discord_dir="$HOME/Applications/$mac_app"
+    else
+        discord_dir="/Applications/$mac_app"
+    fi
+    runtime_dir=${TMPDIR:-/tmp}
+else
+    config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}
+    process_name=$exe
+    discord_dir=${DISCORD_DIR:-"$config_home/$flavor"}
+    runtime_dir=${XDG_RUNTIME_DIR:-"$config_home"}
+fi
 equicord_asar=${EQUICORD_ASAR:-"$config_home/Equicord/equicord.asar"}
-runtime_dir=${XDG_RUNTIME_DIR:-"$config_home"}
 lock_file=${EQUIPATCH_LOCK_FILE:-"$runtime_dir/equipatch-$flavor.lock"}
 
 log() {
@@ -28,12 +46,41 @@ log() {
 }
 
 notify() {
+    local title=$1 body=$2
+    if [[ $os == Darwin ]]; then
+        osascript -e "display notification \"${body//\"/\\\"}\" with title \"${title//\"/\\\"}\"" >/dev/null 2>&1 || true
+        return 0
+    fi
     command -v notify-send >/dev/null || return 0
-    notify-send -a equipatch -i "$launcher" "$@" 2>/dev/null || true
+    notify-send -a equipatch -i "$launcher" "$title" "$body" 2>/dev/null || true
+}
+
+file_size() {
+    if [[ $os == Darwin ]]; then
+        stat -f %z -- "$1"
+    else
+        stat -c %s -- "$1"
+    fi
+}
+
+# chmod --reference is GNU-only.
+copy_mode() {
+    local mode
+    if [[ $os == Darwin ]]; then
+        mode=$(stat -f %Lp -- "$1")
+    else
+        mode=$(stat -c %a -- "$1")
+    fi
+    chmod "$mode" "$2"
 }
 
 find_resources() {
     local discord_host app_dir
+
+    if [[ $os == Darwin ]]; then
+        [[ -d "$discord_dir/Contents/Resources" ]] && printf '%s\n' "$discord_dir/Contents/Resources"
+        return 0
+    fi
 
     discord_host="$discord_dir/$exe"
     if [[ -e "$discord_host" ]]; then
@@ -64,7 +111,25 @@ loader_is_ours() {
 }
 
 discord_running() {
-    pgrep -x "$exe" >/dev/null 2>&1
+    pgrep -x "$process_name" >/dev/null 2>&1
+}
+
+# flock(1) is not available on macOS; fall back to a mkdir lock.
+acquire_lock() {
+    local tries=0
+    if command -v flock >/dev/null; then
+        exec 9>"$lock_file"
+        flock 9
+        return 0
+    fi
+    until mkdir -- "$lock_file.d" 2>/dev/null; do
+        if (( ++tries > 60 )); then
+            log "could not acquire lock: $lock_file.d"
+            return 1
+        fi
+        sleep 1
+    done
+    trap 'rmdir -- "$lock_file.d" 2>/dev/null' EXIT
 }
 
 # Escaped for a JS string literal; the same string is used for the up-to-date check.
@@ -98,7 +163,7 @@ do_patch() {
             return 1
         fi
 
-        if [[ ! -e "$app_asar" || $(stat -c %s -- "$app_asar") -le 131072 ]]; then
+        if [[ ! -e "$app_asar" || $(file_size "$app_asar") -le 131072 ]]; then
             log "unrecognised client-mod patch found; leaving files untouched: $resources"
             return 1
         fi
@@ -116,11 +181,17 @@ do_patch() {
     fi
 
     local loader_tmp
-    loader_tmp=$(mktemp -d --tmpdir="$resources" .equipatch-app.asar.XXXXXX)
+    if ! loader_tmp=$(mktemp -d "$resources/.equipatch-app.asar.XXXXXX" 2>/dev/null); then
+        log "cannot write into $resources"
+        if [[ $os == Darwin ]]; then
+            log "macOS App Management blocks changes to app bundles under /Applications: grant it to your terminal and to /bin/bash in System Settings > Privacy & Security > App Management, or move $mac_app to ~/Applications"
+        fi
+        return 1
+    fi
     trap 'rm -rf -- "$loader_tmp"' RETURN
 
     write_loader "$loader_tmp"
-    chmod --reference="$resources" "$loader_tmp"
+    copy_mode "$resources" "$loader_tmp"
 
     # Back up via hardlink: no copy, and the original is never absent.
     ln -- "$app_asar" "$original_asar"
@@ -132,7 +203,7 @@ do_patch() {
 
     log "Equicord patch applied: $resources"
     if discord_running; then
-        notify "Equicord patch applied" "$exe is already running; restart it to load Equicord."
+        notify "Equicord patch applied" "$process_name is already running; restart it to load Equicord."
     fi
 }
 
@@ -147,7 +218,7 @@ do_unpatch() {
         log "another client mod is installed; leaving files untouched: $resources"
         return 1
     fi
-    if [[ -f "$app_asar" && $(stat -c %s -- "$app_asar") -gt 131072 ]]; then
+    if [[ -f "$app_asar" && $(file_size "$app_asar") -gt 131072 ]]; then
         log "app.asar already looks original; removing stale backup: $resources"
         rm -- "$original_asar"
         return 0
@@ -182,6 +253,12 @@ do_status() {
 do_launch() {
     # Discord must start even if patching fails.
     do_patch || true
+    if [[ $os == Darwin ]]; then
+        if [[ $# -gt 0 ]]; then
+            exec open -a "$discord_dir" --args "$@"
+        fi
+        exec open -a "$discord_dir"
+    fi
     if command -v "$launcher" >/dev/null; then
         exec "$launcher" "$@"
     fi
@@ -190,8 +267,7 @@ do_launch() {
 
 case $command in
     patch|unpatch)
-        exec 9>"$lock_file"
-        flock 9
+        acquire_lock
         "do_$command"
         ;;
     status) do_status ;;

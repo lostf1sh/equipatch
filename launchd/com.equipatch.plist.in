@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.equipatch.@FLAVOR@</string>
+	<key>ProgramArguments</key>
+	<!-- Explicit interpreter: macOS App Management must be granted to /bin/bash. -->
+	<array>
+		<string>/bin/bash</string>
+		<string>@BIN@</string>
+		<string>patch</string>
+		<string>@FLAVOR@</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>DISCORD_DIR</key>
+		<string>@APP@</string>
+	</dict>
+	<!-- Squirrel.Mac swaps the whole bundle on update; both paths fire. -->
+	<key>WatchPaths</key>
+	<array>
+		<string>@APP@</string>
+		<string>@APP@/Contents/Resources</string>
+	</array>
+	<!-- Five-minute fallback for missed events. -->
+	<key>StartInterval</key>
+	<integer>300</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>@LOG@</string>
+	<key>StandardErrorPath</key>
+	<string>@LOG@</string>
+</dict>
+</plist>
